@@ -254,7 +254,7 @@ def render_interactive(
 
     fig = go.Figure()
 
-    # ── 1. Player Voronoi polygon fills ──────────────────────────
+    # ── 1a. Player Voronoi polygon fills (visual only, no hover) ─
     for player_idx, name in enumerate(player_names):
         geom = player_polys.get(player_idx)
         if geom is None or geom.is_empty:
@@ -273,9 +273,32 @@ def render_interactive(
             line=dict(color=color, width=0.8),
             name=name,
             legendgroup=f"region_{player_idx}",
+            hoverinfo="skip",       # hover handled by centroid marker below
+            showlegend=True,
+        ))
+
+    # ── 1b. Invisible centroid markers — reliable hover targets ──
+    # Win mode: smooth Voronoi cells → hover on lines works fine too.
+    # Loss mode: fractal grid edges → impossible to hover; centroid fixes it.
+    for player_idx, name in enumerate(player_names):
+        geom = player_polys.get(player_idx)
+        if geom is None or geom.is_empty:
+            continue
+
+        color   = colors[player_idx]
+        centroid = geom.centroid
+        c_lon, c_lat = centroid.x, centroid.y
+
+        fig.add_trace(go.Scattermapbox(
+            lat=[c_lat],
+            lon=[c_lon],
+            mode="markers",
+            marker=dict(size=1, color=color, opacity=0),   # invisible
+            name=name,
+            legendgroup=f"region_{player_idx}",
+            showlegend=False,
             hovertemplate=(
                 f"<b>{name}</b><br>"
-                "Lat: %{lat:.2f}°  Lon: %{lon:.2f}°<br>"
                 f"<i>{'Nearest' if mode == 'Win' else 'Furthest'} player</i>"
                 "<extra></extra>"
             ),
