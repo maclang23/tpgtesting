@@ -81,49 +81,6 @@ def geometry_to_latlon(geom) -> tuple[list, list]:
     return lats, lons
 
 # ─────────────────────────────────────────────
-# COASTLINE GEOMETRY  (cached permanently)
-# ─────────────────────────────────────────────
-
-@st.cache_data(show_spinner=False)
-def get_coastline_latlons() -> tuple[list, list]:
-    """
-    Extract Natural Earth coastlines + country borders as lat/lon lists
-    with None separators for Plotly line rendering.
-    """
-    from cartopy.feature import NaturalEarthFeature
-
-    all_lats, all_lons = [], []
-
-    def add_geom(geom):
-        if geom.geom_type == "LineString":
-            xs, ys = geom.xy
-            all_lons.extend(list(xs) + [None])
-            all_lats.extend(list(ys) + [None])
-        elif geom.geom_type == "MultiLineString":
-            for part in geom.geoms:
-                xs, ys = part.xy
-                all_lons.extend(list(xs) + [None])
-                all_lats.extend(list(ys) + [None])
-        elif geom.geom_type == "Polygon":
-            xs, ys = geom.exterior.xy
-            all_lons.extend(list(xs) + [None])
-            all_lats.extend(list(ys) + [None])
-        elif geom.geom_type == "MultiPolygon":
-            for poly in geom.geoms:
-                xs, ys = poly.exterior.xy
-                all_lons.extend(list(xs) + [None])
-                all_lats.extend(list(ys) + [None])
-
-    for feat in (
-        NaturalEarthFeature("physical", "coastline",       "110m"),
-        NaturalEarthFeature("cultural", "admin_0_countries", "110m"),
-    ):
-        for geom in feat.geometries():
-            add_geom(geom)
-
-    return all_lats, all_lons
-
-# ─────────────────────────────────────────────
 # API CALLS
 # ─────────────────────────────────────────────
 
@@ -286,6 +243,12 @@ def render_interactive(
     query_lat:    float | None = None,
     query_lon:    float | None = None,
 ) -> go.Figure:
+    """
+    Renders using go.Scattermapbox (Canvas/WebGL) instead of go.Scattergeo (SVG).
+    This fixes Firefox's broken SVG fill behaviour with None-separated multi-polygons.
+    The open-street-map base style requires no Mapbox token and provides
+    coastlines + borders for free, so the custom coastline trace is gone.
+    """
     n      = len(player_names)
     colors = player_colors(n)
 
@@ -298,16 +261,16 @@ def render_interactive(
             continue
 
         color      = colors[player_idx]
-        fill_color = hex_to_rgba(color, 0.70)
+        fill_color = hex_to_rgba(color, 0.65)
         p_lats, p_lons = geometry_to_latlon(geom)
 
-        fig.add_trace(go.Scattergeo(
+        fig.add_trace(go.Scattermapbox(
             lat=p_lats,
             lon=p_lons,
             mode="lines",
             fill="toself",
             fillcolor=fill_color,
-            line=dict(color=color, width=0.6),
+            line=dict(color=color, width=0.8),
             name=name,
             legendgroup=f"region_{player_idx}",
             hovertemplate=(
@@ -318,19 +281,7 @@ def render_interactive(
             ),
         ))
 
-    # ── 2. Coastlines + borders on top ───────────────────────────
-    coast_lats, coast_lons = get_coastline_latlons()
-    fig.add_trace(go.Scattergeo(
-        lat=coast_lats,
-        lon=coast_lons,
-        mode="lines",
-        line=dict(color="rgba(255,255,255,0.85)", width=0.6),
-        hoverinfo="skip",
-        showlegend=False,
-        name="coastlines",
-    ))
-
-    # ── 3. Queried point ─────────────────────────────────────────
+    # ── 2. Queried point ─────────────────────────────────────────
     if query_result is not None and query_lat is not None and query_lon is not None:
         winner     = query_result["result"]
         win_idx    = player_names.index(winner)
@@ -342,20 +293,18 @@ def render_interactive(
             for r in query_result["ranked"]
         )
         # Glow ring
-        fig.add_trace(go.Scattergeo(
+        fig.add_trace(go.Scattermapbox(
             lat=[query_lat], lon=[query_lon], mode="markers",
-            marker=dict(symbol="circle", size=22, color="rgba(0,0,0,0)",
-                        line=dict(color="white", width=2)),
+            marker=dict(size=22, color="rgba(0,0,0,0)"),
             hoverinfo="skip", showlegend=False,
         ))
         # Pin
-        fig.add_trace(go.Scattergeo(
+        fig.add_trace(go.Scattermapbox(
             lat=[query_lat], lon=[query_lon],
             mode="markers+text",
-            marker=dict(symbol="circle", size=14, color=win_color,
-                        line=dict(color="white", width=2)),
+            marker=dict(size=14, color=win_color),
             text=[f"📍 {label_verb}: {winner}"],
-            textposition="top center",
+            textposition="top right",
             textfont=dict(color="white", size=11),
             name="📍 Queried point",
             hovertemplate=(
@@ -375,17 +324,10 @@ def render_interactive(
             text=f"{'🏆 Win Regions' if mode == 'Win' else '💀 Loss Regions'} — Voronoi Map",
             font=dict(color=tc, size=17), x=0.5, xanchor="center",
         ),
-        geo=dict(
-            projection_type="natural earth",
-            showland=True,       landcolor="#1c1c1c",
-            showocean=True,      oceancolor="#1a2a3a",
-            showlakes=True,      lakecolor="#1a2a3a",
-            showcountries=False,
-            showcoastlines=False,  # we draw our own
-            showframe=False,
-            bgcolor="#0e1117",
-            lonaxis=dict(range=[-180, 180]),
-            lataxis=dict(range=[-90, 90]),
+        mapbox=dict(
+            style="open-street-map",
+            center=dict(lat=20, lon=0),
+            zoom=0.5,
         ),
         legend=dict(
             bgcolor="#1e2130", bordercolor="#444444", borderwidth=1,
