@@ -326,19 +326,29 @@ document.getElementById("speed-sl").addEventListener("input", e => {{
 }});
 
 // ── Boot ──────────────────────────────────
-map.on("load", () => {{ mapReady = true; }});
+// ── Boot ──
+map.on("load", () => { 
+    mapReady = true; 
+    console.log("MapReady");
+});
 
-(async () => {{
-  canvas        = document.createElement("canvas");
-  canvas.width  = n_lon; canvas.height = n_lat;
-  ctx           = canvas.getContext("2d");
-  imgData       = ctx.createImageData(n_lon, n_lat);
-  if (!mapReady) await new Promise(r => map.on("load", r));
-  document.getElementById("overlay").classList.add("hidden");
-  update();
-}})();
-</script>
-</body>
-</html>"""
+async function init() {
+    canvas = document.createElement("canvas");
+    canvas.width = n_lon; 
+    canvas.height = n_lat;
+    ctx = canvas.getContext("2d");
+    imgData = ctx.createImageData(n_lon, n_lat);
 
-components.html(HTML, height=680, scrolling=False)
+    // Give the map 2 seconds to load; if it doesn't, show the UI anyway
+    const mapLoadTimeout = new Promise(r => setTimeout(r, 2000));
+    await Promise.any([
+        new Promise(r => map.on("load", r)),
+        mapLoadTimeout
+    ]);
+
+    document.getElementById("overlay").classList.add("hidden");
+    mapReady = true; // Force true even if timeout hit
+    update();
+}
+
+init();
