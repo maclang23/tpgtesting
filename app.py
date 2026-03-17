@@ -326,7 +326,7 @@ let playInterval = null, mapReady = false, sourceAdded = false;
 // ── Fetch binary with progress bar ────────
 async function loadBinary() {{
   setLoading("Fetching grid data…", 0);
-  const resp  = await fetch("app/static/gauntlet_data.bin");
+  const resp  = await fetch(window.parent.location.origin + "/app/static/gauntlet_data.bin");
   if (!resp.ok) throw new Error("Failed to fetch gauntlet_data.bin: " + resp.status);
   const total = parseInt(resp.headers.get("Content-Length") || "0");
   const reader = resp.body.getReader();
