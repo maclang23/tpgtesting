@@ -10,7 +10,6 @@ import streamlit as st
 import streamlit.components.v1 as components
 import json
 import os
-import shutil
 import pandas as pd
 import numpy as np
 import requests
@@ -18,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(page_title="Gauntlet Timelapse", layout="wide")
 
-BIN_PATH   = "gauntlet_data.bin"
+BIN_PATH   = "static/gauntlet_data.bin"
 CSV_PATH   = "roundlist.csv"
 API_PLAYERS = "https://tpg.marsmathis.com/api/players"
 API_SUBS    = "https://tpg.marsmathis.com/api/submissions/{discord_id}"
@@ -140,6 +139,7 @@ if not os.path.exists(BIN_PATH):
         prog2.empty()
 
         grids_array = np.stack([grids_dict[p] for p in player_order], axis=0)
+        os.makedirs("static", exist_ok=True)
         grids_array.tofile(BIN_PATH)
         st.success(f"Saved {BIN_PATH} ({os.path.getsize(BIN_PATH)/1e6:.1f} MB). Commit it to your repo to skip this step next time.")
         st.rerun()
@@ -196,15 +196,6 @@ def load_data():
     return meta
 
 meta = load_data()
-
-# ─────────────────────────────────────────────
-# Copy binary to static/ for direct browser fetch
-# ─────────────────────────────────────────────
-STATIC_DIR = "static"
-STATIC_BIN = os.path.join(STATIC_DIR, "gauntlet_data.bin")
-os.makedirs(STATIC_DIR, exist_ok=True)
-if not os.path.exists(STATIC_BIN) or os.path.getsize(STATIC_BIN) != os.path.getsize(BIN_PATH):
-    shutil.copy2(BIN_PATH, STATIC_BIN)
 
 meta_js = json.dumps(meta, separators=(",", ":"))
 
@@ -326,7 +317,7 @@ let playInterval = null, mapReady = false, sourceAdded = false;
 // ── Fetch binary with progress bar ────────
 async function loadBinary() {{
   setLoading("Fetching grid data…", 0);
-  const resp  = await fetch(window.parent.location.origin + "/app/static/gauntlet_data.bin");
+  const resp  = await fetch("/app/static/gauntlet_data.bin");
   if (!resp.ok) throw new Error("Failed to fetch gauntlet_data.bin: " + resp.status);
   const total = parseInt(resp.headers.get("Content-Length") || "0");
   const reader = resp.body.getReader();
