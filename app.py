@@ -1,157 +1,39 @@
 """
-app.py — Streamlit Cloud deployment wrapper for the Gauntlet Timelapse.
+app.py — Streamlit Cloud deployment for Gauntlet Timelapse.
 
-Requires gauntlet_data.bin and roundlist.csv in the same directory.
-Run precompute.py locally first to generate gauntlet_data.bin, then
-commit both files to your GitHub repo before deploying.
+Run precompute.py locally first to generate static/ranks/*.bin and
+static/player_index.json, then commit the static/ folder to your repo.
 """
 
 import streamlit as st
 import streamlit.components.v1 as components
 import json
 import os
+import struct
+import base64
 import pandas as pd
 import numpy as np
-import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(page_title="Gauntlet Timelapse", layout="wide")
 
-BIN_PATH   = "static/gauntlet_data.bin"
-CSV_PATH   = "roundlist.csv"
-API_PLAYERS = "https://tpg.marsmathis.com/api/players"
-API_SUBS    = "https://tpg.marsmathis.com/api/submissions/{discord_id}"
+CSV_PATH    = "roundlist.csv"
+INDEX_PATH  = "static/player_index.json"
+RANKS_DIR   = "static/ranks"
 GRID_STEP   = 1.0
-R_EARTH     = 6371.0
-MAX_WORKERS = 16
 
 # ─────────────────────────────────────────────
-# Check required files exist
+# Sanity checks
 # ─────────────────────────────────────────────
-if not os.path.exists(CSV_PATH):
-    st.error(f"`{CSV_PATH}` not found. Make sure it is committed to your repo.")
-    st.stop()
-
-if not os.path.exists(BIN_PATH):
-    st.warning(
-        f"`{BIN_PATH}` not found. "
-        "Run `python precompute.py` locally and commit the output to your repo, "
-        "or click the button below to precompute now (takes ~30s)."
-    )
-
-    if st.button("Precompute now (fetches from API)", type="primary"):
-        # ── Load CSV ──────────────────────────────
-        df = pd.read_csv(CSV_PATH)
-        df.columns = [c.strip() for c in df.columns]
-        round_cols = [c for c in df.columns if c.startswith("Round")]
-        player_rows = df[df["Name"] != "Location"].copy()
-        all_players = player_rows["Name"].str.strip().tolist()
-
-        def is_active(val):
-            return not pd.isna(val) and str(val).strip() != ""
-
-        # ── Resolve names ─────────────────────────
-        with st.spinner("Fetching player list from API..."):
-            resp = requests.get(API_PLAYERS, timeout=15)
-            resp.raise_for_status()
-            api_players = resp.json()
-
-        name_to_id = {}
-        for p in api_players:
-            pid  = str(p.get("discord_id") or p.get("id") or "").strip()
-            name = str(p.get("name") or p.get("username") or "").strip()
-            if not pid:
-                continue
-            if name:
-                name_to_id[name.lower()] = pid
-            for val in [p.get("canonical_name")] + list(p.get("aliases") or []):
-                v = str(val or "").strip()
-                if v:
-                    name_to_id[v.lower()] = pid
-
-        resolved = {n: name_to_id[n.lower()] for n in all_players if n.lower() in name_to_id}
-
-        # ── Fetch submissions ──────────────────────
-        def fetch_subs(name, pid):
-            r = requests.get(API_SUBS.format(discord_id=pid), timeout=15)
-            r.raise_for_status()
-            data = r.json()
-            if isinstance(data, dict):
-                data = (data.get("submissions") or data.get("data") or
-                        data.get("results") or (list(data.values())[0] if data else []))
-            if not isinstance(data, list):
-                return name, None
-            rows = [[float(s.get("lat") or s.get("latitude") or 0),
-                     float(s.get("lon") or s.get("lng") or s.get("longitude") or 0)]
-                    for s in data
-                    if (s.get("lat") or s.get("latitude")) is not None]
-            return name, (np.array(rows, dtype=np.float64) if rows else None)
-
-        player_subs = {}
-        prog = st.progress(0, text="Fetching submissions...")
-        done = 0
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            futures = {ex.submit(fetch_subs, n, p): n for n, p in resolved.items()}
-            for future in as_completed(futures):
-                name, pts = future.result()
-                if pts is not None and len(pts) > 0:
-                    player_subs[name] = pts
-                done += 1
-                prog.progress(done / len(resolved), text=f"Fetched {done}/{len(resolved)}")
-        prog.empty()
-
-        # ── Build grids ───────────────────────────
-        lats = np.arange(-90,  91,  GRID_STEP, dtype=np.float64)
-        lons = np.arange(-180, 181, GRID_STEP, dtype=np.float64)
-        N_GRID = len(lats) * len(lons)
-
-        def build_grid(pts, chunk_lats=20):
-            sub_lats = np.radians(pts[:, 0])
-            sub_lons = np.radians(pts[:, 1])
-            N_LAT_loc, N_LON_loc = len(lats), len(lons)
-            out = np.empty((N_LAT_loc, N_LON_loc), dtype=np.float32)
-            for i in range(0, N_LAT_loc, chunk_lats):
-                lat_chunk = np.radians(lats[i:i + chunk_lats])
-                g_lats = lat_chunk[:, None, None]
-                g_lons = np.radians(lons)[None, :, None]
-                s_lats = sub_lats[None, None, :]
-                s_lons = sub_lons[None, None, :]
-                dlat = s_lats - g_lats
-                dlon = s_lons - g_lons
-                a = np.clip(
-                    np.sin(dlat/2)**2 + np.cos(g_lats)*np.cos(s_lats)*np.sin(dlon/2)**2,
-                    0.0, 1.0
-                )
-                out[i:i + chunk_lats] = (R_EARTH * 2 * np.arcsin(np.sqrt(a))).min(axis=2).astype(np.float32)
-            return out
-
-        player_order = [p for p in all_players if p in player_subs]
-        grids_dict = {}
-        prog2 = st.progress(0, text="Building grids...")
-        done2 = 0
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            futures = {ex.submit(build_grid, player_subs[n]): n for n in player_order}
-            for future in as_completed(futures):
-                name = futures[future]
-                grids_dict[name] = future.result()
-                done2 += 1
-                prog2.progress(done2 / len(player_order), text=f"Grid {done2}/{len(player_order)}")
-        prog2.empty()
-
-        grids_array = np.stack([grids_dict[p] for p in player_order], axis=0)
-        os.makedirs("static", exist_ok=True)
-        grids_array.tofile(BIN_PATH)
-        st.success(f"Saved {BIN_PATH} ({os.path.getsize(BIN_PATH)/1e6:.1f} MB). Commit it to your repo to skip this step next time.")
-        st.rerun()
-
-    st.stop()
+for path in [CSV_PATH, INDEX_PATH]:
+    if not os.path.exists(path):
+        st.error(f"`{path}` not found. Run `python precompute.py` locally and commit the output.")
+        st.stop()
 
 # ─────────────────────────────────────────────
-# Load binary and metadata
+# Load metadata (cached)
 # ─────────────────────────────────────────────
-@st.cache_data(show_spinner="Loading grid data...")
-def load_data():
-    # Load CSV
+@st.cache_data(show_spinner=False)
+def load_meta():
     df = pd.read_csv(CSV_PATH)
     df.columns = [c.strip() for c in df.columns]
     round_cols  = [c for c in df.columns if c.startswith("Round")]
@@ -177,36 +59,71 @@ def load_data():
         active = player_rows.loc[player_rows[col].apply(is_active), "Name"].str.strip().tolist()
         round_active[col] = active
 
-    # Determine player count from binary size
-    lats = np.arange(-90,  91,  GRID_STEP)
-    lons = np.arange(-180, 181, GRID_STEP)
-    N_GRID = len(lats) * len(lons)
-    bin_size = os.path.getsize(BIN_PATH)
-    n_players_in_bin = bin_size // (N_GRID * 4)
+    with open(INDEX_PATH) as f:
+        name_to_file = json.load(f)
 
-    # Base64-encode the binary — embedded directly in HTML, no fetch needed
-    import base64
-    with open(BIN_PATH, "rb") as f:
-        raw = f.read()
-    b64 = base64.b64encode(raw).decode("ascii")
+    return all_players, round_cols, round_targets, round_active, name_to_file
 
-    meta = {
-        "players":          all_players,
-        "n_lat":            len(lats),
-        "n_lon":            len(lons),
-        "n_players_in_bin": n_players_in_bin,
-        "round_cols":       round_cols,
-        "round_targets":    round_targets,
-        "round_active":     {col: active for col, active in round_active.items()},
-    }
-    return meta, b64
-
-meta, b64_data = load_data()
-
-meta_js = json.dumps(meta, separators=(",", ":"))
+all_players, round_cols, round_targets, round_active, name_to_file = load_meta()
 
 # ─────────────────────────────────────────────
-# Build HTML — binary is fetched directly, no base64
+# Load per-player rank binary (cached per player)
+# Returns base64-encoded bytes — small enough to embed directly
+# ─────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def load_player_b64(player_name):
+    safe = name_to_file.get(player_name)
+    if not safe:
+        return None
+    fpath = os.path.join(RANKS_DIR, f"{safe}.bin")
+    if not os.path.exists(fpath):
+        return None
+    with open(fpath, "rb") as f:
+        raw = f.read()
+    return base64.b64encode(raw).decode("ascii")
+
+# ─────────────────────────────────────────────
+# Player selector
+# ─────────────────────────────────────────────
+st.title("Gauntlet Timelapse")
+
+players_with_data = [p for p in all_players if name_to_file.get(p) and
+                     os.path.exists(os.path.join(RANKS_DIR, name_to_file[p] + ".bin"))]
+
+selected_player = st.selectbox("Player", sorted(players_with_data))
+
+b64_data = load_player_b64(selected_player)
+if not b64_data:
+    st.error(f"No rank data found for {selected_player}. Re-run precompute.py.")
+    st.stop()
+
+# ─────────────────────────────────────────────
+# Build compact metadata for this player only
+# ─────────────────────────────────────────────
+lats = np.arange(-90, 91, GRID_STEP)
+lons = np.arange(-180, 181, GRID_STEP)
+N_GRID = len(lats) * len(lons)
+
+player_rounds = [col for col in round_cols if selected_player in round_active.get(col, [])]
+
+meta = {
+    "player":        selected_player,
+    "n_lat":         len(lats),
+    "n_lon":         len(lons),
+    "n_grid":        N_GRID,
+    "round_cols":    player_rounds,
+    "round_targets": {col: round_targets.get(col) for col in player_rounds},
+    "round_active_counts": {col: len(round_active.get(col, [])) for col in player_rounds},
+}
+meta_js = json.dumps(meta, separators=(",", ":"))
+
+fsize = len(base64.b64decode(b64_data))
+st.caption(f"{selected_player} · {len(player_rounds)} rounds · {fsize/1e3:.0f} KB rank data")
+
+# ─────────────────────────────────────────────
+# HTML component
+# The b64 payload is now ~50–200 KB (uint8 ranks) vs 35 MB (float32 distances)
+# atob() on 200 KB is instant
 # ─────────────────────────────────────────────
 HTML = f"""<!DOCTYPE html>
 <html lang="en">
@@ -215,71 +132,57 @@ HTML = f"""<!DOCTYPE html>
 <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
 <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
 <style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: system-ui, sans-serif; background: #1a1a2e; color: #e0e0e0;
-          display: flex; flex-direction: column; height: 100vh; overflow: hidden; }}
+  * {{ box-sizing:border-box; margin:0; padding:0; }}
+  body {{ font-family:system-ui,sans-serif; background:#1a1a2e; color:#e0e0e0;
+          display:flex; flex-direction:column; height:100vh; overflow:hidden; }}
 
-  #toolbar {{
-    background: #16213e; border-bottom: 1px solid #0f3460;
-    padding: 10px 16px; display: flex; align-items: center; gap: 20px; flex-shrink: 0;
-    flex-wrap: wrap;
-  }}
-  #toolbar h1 {{ font-size: 1rem; font-weight: 700; color: #e94560; white-space: nowrap; }}
+  #toolbar {{ background:#16213e; border-bottom:1px solid #0f3460;
+    padding:10px 16px; display:flex; align-items:center; gap:18px; flex-shrink:0; flex-wrap:wrap; }}
+  #toolbar h1 {{ font-size:1rem; font-weight:700; color:#e94560; white-space:nowrap; }}
 
-  .ctrl {{ display: flex; align-items: center; gap: 8px; }}
-  label {{ font-size: 0.75rem; color: #8892b0; white-space: nowrap; }}
-  select {{
-    background: #0f3460; color: #e0e0e0; border: 1px solid #1a4a8a;
-    border-radius: 6px; padding: 6px 8px; font-size: 0.85rem; cursor: pointer;
-  }}
-  input[type=range] {{ accent-color: #e94560; cursor: pointer; width: 180px; }}
+  .ctrl {{ display:flex; align-items:center; gap:8px; }}
+  label {{ font-size:0.75rem; color:#8892b0; white-space:nowrap; }}
+  input[type=range] {{ accent-color:#e94560; cursor:pointer; width:200px; }}
 
-  .stat {{ background: #0f3460; border-radius: 6px; padding: 6px 12px; text-align: center; }}
-  .stat .val {{ font-size: 1.1rem; font-weight: 700; color: #e94560; }}
-  .stat .key {{ font-size: 0.65rem; color: #8892b0; }}
+  .stat {{ background:#0f3460; border-radius:6px; padding:6px 12px; text-align:center; }}
+  .stat .val {{ font-size:1.1rem; font-weight:700; color:#e94560; }}
+  .stat .key {{ font-size:0.65rem; color:#8892b0; }}
 
-  .play-btn {{
-    background: #e94560; color: white; border: none; border-radius: 6px;
-    padding: 7px 16px; font-size: 0.85rem; font-weight: 600; cursor: pointer;
-  }}
-  .play-btn.playing {{ background: #0f3460; border: 1px solid #e94560; color: #e94560; }}
+  .play-btn {{ background:#e94560; color:white; border:none; border-radius:6px;
+    padding:7px 16px; font-size:0.85rem; font-weight:600; cursor:pointer; }}
+  .play-btn.playing {{ background:#0f3460; border:1px solid #e94560; color:#e94560; }}
 
-  #map-wrap {{ flex: 1; position: relative; }}
-  #map {{ width: 100%; height: 100%; }}
+  .ctrl-s {{ display:flex; align-items:center; gap:6px; }}
 
-  #legend {{
-    position: absolute; bottom: 30px; left: 10px; z-index: 5;
-    background: rgba(22,33,62,0.9); border-radius: 8px; padding: 8px 12px;
-  }}
-  .li {{ display: flex; align-items: center; gap: 6px; font-size: 0.75rem; color: #a8b2d8; margin-bottom: 4px; }}
-  .li:last-child {{ margin-bottom: 0; }}
-  .sw {{ width: 14px; height: 14px; border-radius: 2px; flex-shrink: 0; }}
+  #map-wrap {{ flex:1; position:relative; }}
+  #map {{ width:100%; height:100%; }}
 
-  #overlay {{
-    position: absolute; inset: 0; background: rgba(26,26,46,0.9);
-    display: flex; flex-direction: column; align-items: center; justify-content: center;
-    z-index: 10; gap: 12px;
-  }}
-  #overlay.hidden {{ display: none; }}
-  .spinner {{ width: 40px; height: 40px; border: 3px solid #0f3460; border-top-color: #e94560; border-radius: 50%; animation: spin 0.8s linear infinite; }}
-  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-  #load-msg {{ font-size: 0.9rem; color: #a8b2d8; }}
-  #load-bar-wrap {{ width: 200px; height: 5px; background: #0f3460; border-radius: 3px; }}
-  #load-bar {{ height: 100%; background: #e94560; border-radius: 3px; width: 0%; transition: width 0.15s; }}
+  #legend {{ position:absolute; bottom:30px; left:10px; z-index:5;
+    background:rgba(22,33,62,0.9); border-radius:8px; padding:8px 12px; }}
+  .li {{ display:flex; align-items:center; gap:6px; font-size:0.75rem; color:#a8b2d8; margin-bottom:4px; }}
+  .li:last-child {{ margin-bottom:0; }}
+  .sw {{ width:14px; height:14px; border-radius:2px; flex-shrink:0; }}
+
+  #overlay {{ position:absolute; inset:0; background:rgba(26,26,46,0.9);
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    z-index:10; gap:12px; }}
+  #overlay.hidden {{ display:none; }}
+  .spinner {{ width:40px; height:40px; border:3px solid #0f3460;
+    border-top-color:#e94560; border-radius:50%; animation:spin 0.8s linear infinite; }}
+  @keyframes spin {{ to{{ transform:rotate(360deg); }} }}
+  #load-msg {{ font-size:0.9rem; color:#a8b2d8; }}
 </style>
 </head>
 <body>
-
 <div id="toolbar">
   <h1>Gauntlet Timelapse</h1>
-  <div class="ctrl"><label>Player</label><select id="player-sel"></select></div>
   <div class="ctrl"><label>Round</label><input type="range" id="round-sl" min="0" max="0" value="0"></div>
   <div class="stat"><div class="val" id="s-round">—</div><div class="key">Round</div></div>
   <div class="stat"><div class="val" id="s-active">—</div><div class="key">Active</div></div>
-  <div class="stat" id="s-target-wrap" style="display:none">
+  <div class="stat" id="tgt-wrap" style="display:none">
     <div class="val" style="font-size:0.75rem" id="s-target">—</div><div class="key">Target</div>
   </div>
-  <div class="ctrl">
+  <div class="ctrl-s">
     <label>Speed</label>
     <input type="range" id="speed-sl" min="1" max="10" value="3" style="width:80px">
     <span id="speed-lbl" style="font-size:0.8rem;color:#e94560">3×</span>
@@ -288,102 +191,76 @@ HTML = f"""<!DOCTYPE html>
 </div>
 
 <div id="map-wrap">
-  <div id="overlay">
-    <div class="spinner"></div>
-    <div id="load-msg">Decoding grid data…</div>
-    <div id="load-bar-wrap"><div id="load-bar"></div></div>
-  </div>
+  <div id="overlay"><div class="spinner"></div><div id="load-msg">Loading…</div></div>
   <div id="map"></div>
   <div id="legend">
-    <div class="li"><div class="sw" style="background:#006600"></div>1st place</div>
-    <div class="li"><div class="sw" style="background:#00CC00"></div>2nd – 3rd</div>
-    <div class="li"><div class="sw" style="background:#FF6666"></div>3rd – 2nd last</div>
-    <div class="li"><div class="sw" style="background:#8B0000"></div>Last place</div>
+    <div class="li"><div class="sw" style="background:#006600"></div>1st</div>
+    <div class="li"><div class="sw" style="background:#00CC00"></div>2nd–3rd</div>
+    <div class="li"><div class="sw" style="background:#FF6666"></div>3rd–2nd last</div>
+    <div class="li"><div class="sw" style="background:#8B0000"></div>Last</div>
   </div>
 </div>
 
 <script>
-const META   = {meta_js};
-const B64    = "{b64_data}";
+// ── Embedded data ──────────────────────────
+const META = {meta_js};
+const B64  = "{b64_data}";
 
-const {{ players, n_lat, n_lon, round_cols, round_targets, round_active }} = META;
-const N_GRID = n_lat * n_lon;
+const {{ player, n_lat, n_lon, n_grid, round_cols, round_targets, round_active_counts }} = META;
 
+// ── Decode binary (uint8 rank data) ───────
+// Format: uint16 n_rounds, uint32 n_grid,
+//   per round: uint16 rnum, uint16 n_active, n_grid×uint8 rank
+function decodeBinary(b64) {{
+  const bin = atob(b64);
+  const buf = new ArrayBuffer(bin.length);
+  const u8  = new Uint8Array(buf);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  const view     = new DataView(buf);
+  const n_rounds = view.getUint16(0, true);
+  const ng       = view.getUint32(2, true);
+  const rounds   = [];
+  let offset     = 6;
+  for (let i = 0; i < n_rounds; i++) {{
+    const rnum     = view.getUint16(offset,     true); offset += 2;
+    const n_active = view.getUint16(offset,     true); offset += 2;
+    const ranks    = new Uint8Array(buf, offset, ng);  offset += ng;
+    rounds.push({{ rnum, n_active, ranks }});
+  }}
+  return rounds;
+}}
+
+const roundData = decodeBinary(B64);   // instant — only ~100–200 KB
+const n_rounds  = roundData.length;
+
+// ── MapLibre ──────────────────────────────
 const map = new maplibregl.Map({{
   container: "map",
   style: "https://demotiles.maplibre.org/style.json",
   center: [0, 20], zoom: 1.2, minZoom: 0.5, maxZoom: 8,
 }});
 
-let grids = null;
 let canvas, ctx, imgData;
-let curPlayerIdx = 0, curRoundIdx = 0;
-let activeRoundCols = [];
+let curIdx = 0;
 let playInterval = null, mapReady = false, sourceAdded = false;
-
-// ── Decode base64 in a Web Worker ─────────
-// Runs off the main thread so the spinner stays animated and
-// the browser doesn't appear frozen.
-function decodeInWorker(b64) {{
-  return new Promise((resolve, reject) => {{
-    const workerSrc = `
-      self.onmessage = function(e) {{
-        const b64 = e.data;
-        const bin = atob(b64);
-        const buf = new ArrayBuffer(bin.length);
-        const u8  = new Uint8Array(buf);
-        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-        self.postMessage(buf, [buf]);
-      }};
-    `;
-    const blob   = new Blob([workerSrc], {{ type: "application/javascript" }});
-    const url    = URL.createObjectURL(blob);
-    const worker = new Worker(url);
-    worker.onmessage = (e) => {{
-      URL.revokeObjectURL(url);
-      worker.terminate();
-      resolve(new Float32Array(e.data));
-    }};
-    worker.onerror = (e) => {{
-      URL.revokeObjectURL(url);
-      worker.terminate();
-      reject(e);
-    }};
-    worker.postMessage(b64);
-  }});
-}}
-
-// ── Rank grid ─────────────────────────────
-function computeRank(playerIdx, activeIndices) {{
-  const myOff    = playerIdx * N_GRID;
-  const rankGrid = new Uint8Array(N_GRID);
-  for (const oi of activeIndices) {{
-    if (oi === playerIdx) continue;
-    const oOff = oi * N_GRID;
-    for (let i = 0; i < N_GRID; i++) {{
-      if (grids[oOff + i] < grids[myOff + i]) rankGrid[i]++;
-    }}
-  }}
-  return rankGrid;
-}}
 
 // ── Canvas paint ──────────────────────────
 const C = {{
-  dg: [0,102,0,230], lg: [0,204,0,153],
-  lr: [255,102,102,153], dr: [139,0,0,230], none: [0,0,0,0],
+  dg:[0,102,0,230], lg:[0,204,0,153],
+  lr:[255,102,102,153], dr:[139,0,0,230], none:[0,0,0,0],
 }};
-function paintCanvas(rankGrid, nActive) {{
+function paint(ranks, nActive) {{
   const d = imgData.data;
   for (let li = 0; li < n_lat; li++) {{
     for (let oj = 0; oj < n_lon; oj++) {{
-      const gi  = li * n_lon + oj;
-      const ci  = (n_lat - 1 - li) * n_lon + oj;  // flip Y
-      const r   = rankGrid[gi];
-      const c   = r === 0         ? C.dg
-                : r <= 2          ? C.lg
-                : r >= nActive-1  ? C.dr
-                : (r >= nActive-3 && nActive > 4) ? C.lr
-                : C.none;
+      const gi = li * n_lon + oj;
+      const ci = (n_lat - 1 - li) * n_lon + oj;
+      const r  = ranks[gi];
+      const c  = r === 0              ? C.dg
+               : r <= 2               ? C.lg
+               : r >= nActive - 1     ? C.dr
+               : (r >= nActive-3 && nActive > 4) ? C.lr
+               : C.none;
       const p = ci * 4;
       d[p]=c[0]; d[p+1]=c[1]; d[p+2]=c[2]; d[p+3]=c[3];
     }}
@@ -391,63 +268,41 @@ function paintCanvas(rankGrid, nActive) {{
   ctx.putImageData(imgData, 0, 0);
 }}
 
-// ── MapLibre layer ─────────────────────────
 const COORDS = [[-180,90],[180,90],[180,-90],[-180,-90]];
-function pushToMap() {{
+function pushMap() {{
   const url = canvas.toDataURL("image/png");
   if (!sourceAdded) {{
     map.addSource("rk", {{ type:"image", url, coordinates:COORDS }});
     map.addLayer({{ id:"rk-layer", type:"raster", source:"rk",
-                   paint:{{"raster-opacity":0.75,"raster-fade-duration":0}} }});
+      paint:{{"raster-opacity":0.75,"raster-fade-duration":0}} }});
     sourceAdded = true;
   }} else {{
     map.getSource("rk").updateImage({{ url, coordinates:COORDS }});
   }}
 }}
 
-// ── Update ────────────────────────────────
 function update() {{
-  if (!grids || !mapReady || !activeRoundCols.length) return;
-  const col     = activeRoundCols[curRoundIdx];
-  const names   = round_active[col] || [];
-  const indices = names.map(n => players.indexOf(n)).filter(i => i >= 0);
-  const nActive = indices.length;
-  const rnum    = col.replace("Round ","");
-
+  if (!mapReady || !roundData.length) return;
+  const {{ rnum, n_active, ranks }} = roundData[curIdx];
   document.getElementById("s-round").textContent  = rnum;
-  document.getElementById("s-active").textContent = nActive;
-  document.getElementById("round-sl").value       = curRoundIdx;
+  document.getElementById("s-active").textContent = n_active;
+  document.getElementById("round-sl").value       = curIdx;
 
+  const col = `Round ${{rnum}}`;
   const tgt = round_targets[col];
   if (tgt) {{
-    document.getElementById("s-target").textContent =
-      tgt[0].toFixed(3)+", "+tgt[1].toFixed(3);
-    document.getElementById("s-target-wrap").style.display = "";
+    document.getElementById("s-target").textContent = tgt[0].toFixed(3)+", "+tgt[1].toFixed(3);
+    document.getElementById("tgt-wrap").style.display = "";
   }}
-
-  paintCanvas(computeRank(curPlayerIdx, indices), nActive);
-  pushToMap();
-}}
-
-// ── Player change ─────────────────────────
-function onPlayerChange() {{
-  const name    = document.getElementById("player-sel").value;
-  curPlayerIdx  = players.indexOf(name);
-  curRoundIdx   = 0;
-  activeRoundCols = round_cols.filter(col =>
-    (round_active[col] || []).includes(name)
-  );
-  const sl = document.getElementById("round-sl");
-  sl.max   = activeRoundCols.length - 1;
-  sl.value = 0;
-  update();
+  paint(ranks, n_active);
+  pushMap();
 }}
 
 // ── Controls ──────────────────────────────
+document.getElementById("round-sl").max = n_rounds - 1;
 document.getElementById("round-sl").addEventListener("input", e => {{
-  curRoundIdx = +e.target.value; update();
+  curIdx = +e.target.value; update();
 }});
-document.getElementById("player-sel").addEventListener("change", onPlayerChange);
 
 const playBtn = document.getElementById("play-btn");
 playBtn.addEventListener("click", () => {{
@@ -459,8 +314,8 @@ playBtn.addEventListener("click", () => {{
     const spd = +document.getElementById("speed-sl").value;
     const ms  = Math.max(80, 1100 - spd * 100);
     playInterval = setInterval(() => {{
-      curRoundIdx = (curRoundIdx + 1) % activeRoundCols.length;
-      document.getElementById("round-sl").value = curRoundIdx;
+      curIdx = (curIdx + 1) % n_rounds;
+      document.getElementById("round-sl").value = curIdx;
       update();
     }}, ms);
   }}
@@ -474,37 +329,16 @@ document.getElementById("speed-sl").addEventListener("input", e => {{
 map.on("load", () => {{ mapReady = true; }});
 
 (async () => {{
-  document.getElementById("load-msg").textContent = "Decoding grid data…";
-  setLoading("Decoding grid data…", 10);
-  grids = await decodeInWorker(B64);
-  setLoading("Decoding grid data…", 100);
-
-  canvas       = document.createElement("canvas");
+  canvas        = document.createElement("canvas");
   canvas.width  = n_lon; canvas.height = n_lat;
   ctx           = canvas.getContext("2d");
   imgData       = ctx.createImageData(n_lon, n_lat);
-
-  const sel = document.getElementById("player-sel");
-  players.forEach(name => {{
-    const o = document.createElement("option");
-    o.value = o.text = name; sel.appendChild(o);
-  }});
-
   if (!mapReady) await new Promise(r => map.on("load", r));
   document.getElementById("overlay").classList.add("hidden");
-  onPlayerChange();
+  update();
 }})();
 </script>
 </body>
 </html>"""
 
-# ─────────────────────────────────────────────
-# Render
-# ─────────────────────────────────────────────
-st.title("Gauntlet Timelapse")
-st.caption(
-    f"Grid data loaded: {os.path.getsize(BIN_PATH)/1e6:.1f} MB · "
-    f"{meta['n_players_in_bin']} players · {len(meta['round_cols'])} rounds"
-)
-
-components.html(HTML, height=700, scrolling=False)
+components.html(HTML, height=680, scrolling=False)
