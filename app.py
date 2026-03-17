@@ -124,30 +124,30 @@ function render(idx) {{
     if(!data) return;
     
     const imgData = ctx.createImageData(canvas.width, canvas.height);
-    const ranks = data.ranks;
+    const ranks   = data.ranks;
     const nActive = data.nActive;
 
-    for(let i=0; i < ranks.length; i++) {{
-        const r = ranks[i];
-        if (r === 255) continue; // Out of bounds/NaN
+    for(let li = 0; li < META.n_lat; li++) {{
+        for(let lj = 0; lj < META.n_lon; lj++) {{
+            const gi  = li * META.n_lon + lj;                          // rank array: row 0 = south (-90)
+            const ci  = (META.n_lat - 1 - li) * META.n_lon + lj;      // canvas: row 0 = north (+90)
+            const pos = ci * 4;
+            const r   = ranks[gi];
 
-        const x = i % META.n_lon;
-        const y = META.n_lat - 1 - Math.floor(i / META.n_lon); // Flip Y to match map
-        const pos = (y * META.n_lon + x) * 4;
-        
-        // Heatmap Logic
-        if (r === 0) {{ // 1st Place (Bright Green)
-            imgData.data[pos]=0; imgData.data[pos+1]=255; imgData.data[pos+2]=0; imgData.data[pos+3]=220;
-        }} else if (r < 5) {{ // Top 5 (Yellow)
-            imgData.data[pos]=255; imgData.data[pos+1]=255; imgData.data[pos+2]=0; imgData.data[pos+3]=160;
-        }} else if (r >= nActive - 1) {{ // Last Place (Red)
-            imgData.data[pos]=255; imgData.data[pos+1]=0; imgData.data[pos+2]=0; imgData.data[pos+3]=180;
+            if (r === 0) {{
+                imgData.data[pos]=0;   imgData.data[pos+1]=255; imgData.data[pos+2]=0;   imgData.data[pos+3]=220;
+            }} else if (r < 5) {{
+                imgData.data[pos]=255; imgData.data[pos+1]=255; imgData.data[pos+2]=0;   imgData.data[pos+3]=160;
+            }} else if (r >= nActive - 1) {{
+                imgData.data[pos]=255; imgData.data[pos+1]=0;   imgData.data[pos+2]=0;   imgData.data[pos+3]=180;
+            }}
+            // else: stays transparent (0,0,0,0) from createImageData
         }}
     }}
     
     ctx.putImageData(imgData, 0, 0);
     const url = canvas.toDataURL();
-    const coords = [[-180, 90], [180, 90], [180, -90], [-180, -90]];
+    const coords = [[-179.9, 89.9], [179.9, 89.9], [179.9, -89.9], [-179.9, -89.9]];
 
     if(!sourceAdded) {{
         map.addSource('ranks', {{ type: 'image', url: url, coordinates: coords }});
