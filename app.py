@@ -9,8 +9,8 @@ commit both files to your GitHub repo before deploying.
 import streamlit as st
 import streamlit.components.v1 as components
 import json
-import base64
 import os
+import shutil
 import pandas as pd
 import numpy as np
 import requests
@@ -177,48 +177,39 @@ def load_data():
         active = player_rows.loc[player_rows[col].apply(is_active), "Name"].str.strip().tolist()
         round_active[col] = active
 
-    # Load binary and base64-encode it
-    with open(BIN_PATH, "rb") as f:
-        raw = f.read()
-    b64 = base64.b64encode(raw).decode("ascii")
-
-    # Determine player order from binary size
+    # Determine player count from binary size (no base64 needed)
     lats = np.arange(-90,  91,  GRID_STEP)
     lons = np.arange(-180, 181, GRID_STEP)
     N_GRID = len(lats) * len(lons)
-    n_players_in_bin = len(raw) // (N_GRID * 4)
-
-    # Players in the bin are those from all_players that had API data,
-    # in original order — we can't know exactly without rerunning precompute,
-    # but precompute.py uses all_players order filtered to those with data.
-    # We expose all_players to JS and let it figure out indices.
+    bin_size = os.path.getsize(BIN_PATH)
+    n_players_in_bin = bin_size // (N_GRID * 4)
 
     meta = {
-        "players":              all_players,
-        "n_lat":                len(lats),
-        "n_lon":                len(lons),
-        "n_players_in_bin":     n_players_in_bin,
-        "round_cols":           round_cols,
-        "round_targets":        round_targets,
-        "round_active":         {col: active for col, active in round_active.items()},
+        "players":          all_players,
+        "n_lat":            len(lats),
+        "n_lon":            len(lons),
+        "n_players_in_bin": n_players_in_bin,
+        "round_cols":       round_cols,
+        "round_targets":    round_targets,
+        "round_active":     {col: active for col, active in round_active.items()},
     }
-    return meta, b64
+    return meta
 
-meta, b64_data = load_data()
+meta = load_data()
 
 # ─────────────────────────────────────────────
-# Build round_active_indices in Python
-# (maps player name → index in binary)
+# Copy binary to static/ for direct browser fetch
 # ─────────────────────────────────────────────
-# The binary was built by precompute.py using player_order = [p for p in all_players if p in player_subs]
-# We can reconstruct this from what's in the binary vs all_players.
-# Since we don't have the exact list, we expose all_players and compute indices in JS
-# using the same logic: players.indexOf(name).
+STATIC_DIR = "static"
+STATIC_BIN = os.path.join(STATIC_DIR, "gauntlet_data.bin")
+os.makedirs(STATIC_DIR, exist_ok=True)
+if not os.path.exists(STATIC_BIN) or os.path.getsize(STATIC_BIN) != os.path.getsize(BIN_PATH):
+    shutil.copy2(BIN_PATH, STATIC_BIN)
 
 meta_js = json.dumps(meta, separators=(",", ":"))
 
 # ─────────────────────────────────────────────
-# Build the HTML with base64 data injected
+# Build HTML — binary is fetched directly, no base64
 # ─────────────────────────────────────────────
 HTML = f"""<!DOCTYPE html>
 <html lang="en">
@@ -316,7 +307,6 @@ HTML = f"""<!DOCTYPE html>
 
 <script>
 const META   = {meta_js};
-const B64    = "{b64_data}";
 
 const {{ players, n_lat, n_lon, round_cols, round_targets, round_active }} = META;
 const N_GRID   = n_lat * n_lon;
@@ -333,12 +323,24 @@ let curPlayerIdx = 0, curRoundIdx = 0;
 let activeRoundCols = [];
 let playInterval = null, mapReady = false, sourceAdded = false;
 
-// ── Base64 → Float32Array ──────────────────
-async function b64ToFloat32(b64) {{
-  // fetch() on a data URL uses the browser's native C++ base64 decoder —
-  // orders of magnitude faster than the JS atob() + charCodeAt loop.
-  const resp   = await fetch("data:application/octet-stream;base64," + b64);
-  const buffer = await resp.arrayBuffer();
+// ── Fetch binary with progress bar ────────
+async function loadBinary() {{
+  setLoading("Fetching grid data…", 0);
+  const resp  = await fetch("app/static/gauntlet_data.bin");
+  if (!resp.ok) throw new Error("Failed to fetch gauntlet_data.bin: " + resp.status);
+  const total = parseInt(resp.headers.get("Content-Length") || "0");
+  const reader = resp.body.getReader();
+  const chunks = [];
+  let received = 0;
+  while (true) {{
+    const {{ done, value }} = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.byteLength;
+    if (total > 0) setLoading("Fetching grid data…", received / total * 100);
+  }}
+  const blob   = new Blob(chunks);
+  const buffer = await blob.arrayBuffer();
   return new Float32Array(buffer);
 }}
 
@@ -463,8 +465,8 @@ document.getElementById("speed-sl").addEventListener("input", e => {{
 map.on("load", () => {{ mapReady = true; }});
 
 (async () => {{
-  document.getElementById("load-msg").textContent = "Decoding grid data…";
-  grids = await b64ToFloat32(B64);
+  document.getElementById("load-msg").textContent = "Fetching grid data…";
+  grids = await loadBinary();
   document.getElementById("load-bar").style.width = "100%";
 
   canvas       = document.createElement("canvas");
