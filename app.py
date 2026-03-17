@@ -1,101 +1,89 @@
 import streamlit as st
 import streamlit.components.v1 as components
-import json
-import os
-import base64
+import json, os, base64
 import pandas as pd
 import numpy as np
 
 st.set_page_config(page_title="Gauntlet Timelapse", layout="wide")
 
+# Paths
 CSV_PATH    = "roundlist.csv"
 INDEX_PATH  = "static/player_index.json"
 RANKS_DIR   = "static/ranks"
-GRID_STEP   = 1.0
 
 @st.cache_data(show_spinner=False)
-def load_meta():
+def load_everything():
     if not os.path.exists(CSV_PATH) or not os.path.exists(INDEX_PATH):
         return None
+    
+    # Load Round Meta
     df = pd.read_csv(CSV_PATH)
     df.columns = [c.strip() for c in df.columns]
-    round_cols  = [c for c in df.columns if c.startswith("Round")]
-    loc_row     = df[df["Name"] == "Location"].iloc[0]
-    player_rows = df[df["Name"] != "Location"].copy()
-    all_players = player_rows["Name"].str.strip().tolist()
-
+    round_cols = [c for c in df.columns if c.startswith("Round")]
+    
+    # Get Locations
+    loc_row = df[df["Name"] == "Location"].iloc[0]
     round_targets = {}
     for col in round_cols:
         val = loc_row[col]
-        if not pd.isna(val) and str(val).strip():
+        if not pd.isna(val):
             try:
-                parts = str(val).split(",")
-                round_targets[col] = [float(parts[1].strip()), float(parts[0].strip())] # [lon, lat]
+                # Expecting "lat, lon" in CSV
+                p = str(val).split(",")
+                round_targets[col] = [float(p[1].strip()), float(p[0].strip())] # [lon, lat]
             except: pass
 
-    round_active = {}
-    for col in round_cols:
-        active = player_rows.loc[~player_rows[col].isna(), "Name"].str.strip().tolist()
-        round_active[col] = active
-
+    # Player Mapping
     with open(INDEX_PATH) as f:
         name_to_file = json.load(f)
+    
+    return sorted(list(name_to_file.keys())), round_cols, round_targets, name_to_file
 
-    return all_players, round_cols, round_targets, round_active, name_to_file
-
-meta_data = load_meta()
-if not meta_data:
-    st.error("Missing files. Check `roundlist.csv` and `static/` folder.")
+data = load_everything()
+if not data:
+    st.error("Data files missing in static/ folder.")
     st.stop()
 
-all_players, round_cols, round_targets, round_active, name_to_file = meta_data
+players, round_cols, round_targets, name_to_file = data
+selected_player = st.selectbox("Select Player to View Win/Loss Regions", players)
 
-@st.cache_data(show_spinner=False)
-def load_player_b64(player_name):
-    safe = name_to_file.get(player_name)
-    fpath = os.path.join(RANKS_DIR, f"{safe}.bin")
-    if not os.path.exists(fpath): return None
-    with open(fpath, "rb") as f:
-        return base64.b64encode(f.read()).decode("ascii")
+def get_player_data(name):
+    fname = name_to_file.get(name)
+    fpath = os.path.join(RANKS_DIR, f"{fname}.bin")
+    if os.path.exists(fpath):
+        with open(fpath, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+    return ""
 
-st.title("Gauntlet Timelapse")
+b64_data = get_player_data(selected_player)
 
-players_with_data = [p for p in all_players if name_to_file.get(p) and 
-                     os.path.exists(os.path.join(RANKS_DIR, name_to_file[p] + ".bin"))]
+# JS Metadata
+meta_js = json.dumps({
+    "targets": round_targets,
+    "rounds": round_cols,
+    "n_lat": 181,
+    "n_lon": 361
+})
 
-selected_player = st.selectbox("Select Player", sorted(players_with_data))
-b64_data = load_player_b64(selected_player)
-
-lats = np.arange(-90, 91, GRID_STEP)
-lons = np.arange(-180, 181, GRID_STEP)
-
-meta = {
-    "n_lat": len(lats),
-    "n_lon": len(lons),
-    "round_targets": round_targets,
-    "round_names": round_cols
-}
-meta_js = json.dumps(meta)
-
-HTML = f"""<!DOCTYPE html>
+HTML = f"""
+<!DOCTYPE html>
 <html>
 <head>
     <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
     <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
     <style>
-        body {{ margin:0; padding:0; background:#111; color:white; font-family:sans-serif; height:100vh; display:flex; flex-direction:column; }}
-        #controls {{ height:50px; background:#222; display:flex; align-items:center; padding:0 15px; gap:15px; border-bottom:1px solid #444; }}
-        #map {{ flex:1; width:100%; }}
-        .stat {{ font-size:0.8rem; background:#333; padding:4px 8px; border-radius:4px; }}
-        .val {{ color:#00ff00; font-weight:bold; }}
+        body {{ margin:0; padding:0; background:#111; font-family: sans-serif; }}
+        #map {{ position:absolute; top:50px; bottom:0; width:100%; }}
+        #ui {{ position:absolute; top:0; height:50px; width:100%; background:#222; 
+               display:flex; align-items:center; padding:0 20px; gap:20px; color:white; }}
+        input[type=range] {{ width: 400px; }}
     </style>
 </head>
 <body>
-    <div id="controls">
-        <button id="play-btn" style="padding:5px 10px; cursor:pointer;">▶ Play</button>
-        <input type="range" id="round-sl" min="0" value="0" style="width:300px">
-        <div class="stat">Round: <span class="val" id="s-round">0</span></div>
-        <div class="stat">Active Players: <span class="val" id="s-active">0</span></div>
+    <div id="ui">
+        <button id="play" style="padding:5px 15px;">▶ Play</button>
+        <input type="range" id="slider" min="0" value="0">
+        <div id="info">Loading data...</div>
     </div>
     <div id="map"></div>
 
@@ -103,73 +91,69 @@ HTML = f"""<!DOCTYPE html>
 const META = {meta_js};
 const B64 = "{b64_data}";
 
-const style = {{
-    "version": 8,
-    "sources": {{ "osm": {{ "type": "raster", "tiles": ["https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png"], "tileSize": 256 }} }},
-    "layers": [{{ "id": "osm", "type": "raster", "source": "osm" }}]
-}};
+// Initialize Map
+const map = new maplibregl.Map({{
+    container: 'map',
+    style: {{
+        "version": 8,
+        "sources": {{ "osm": {{ "type": "raster", "tiles": ["https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png"], "tileSize": 256 }} }},
+        "layers": [{{ "id": "osm", "type": "raster", "source": "osm" }}]
+    }},
+    center: [0, 20], zoom: 1.5
+}});
 
-function decodeBinary(b64) {{
-    const bin = atob(b64);
-    const buf = new ArrayBuffer(bin.length);
-    const u8 = new Uint8Array(buf);
-    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-    const view = new DataView(buf);
-    const n_rounds = view.getUint16(0, true);
-    const ng = view.getUint32(2, true);
-    const rounds = [];
+function decode(b64) {{
+    const str = atob(b64);
+    const buf = new Uint8Array(str.length);
+    for(let i=0; i<str.length; i++) buf[i] = str.charCodeAt(i);
+    const view = new DataView(buf.buffer);
+    const nRounds = view.getUint16(0, true);
+    const gridSize = view.getUint32(2, true);
+    
+    let rounds = [];
     let offset = 6;
-    for (let i = 0; i < n_rounds; i++) {{
-        const rnum = view.getUint16(offset, true); offset += 2;
-        const n_active = view.getUint16(offset, true); offset += 2;
-        const ranks = new Uint8Array(buf, offset, ng); offset += ng;
-        rounds.push({{ rnum, n_active, ranks }});
+    for(let i=0; i<nRounds; i++) {{
+        offset += 2; // skip rnum
+        const nActive = view.getUint16(offset, true); offset += 2;
+        const ranks = buf.slice(offset, offset + gridSize); offset += gridSize;
+        rounds.push({{ nActive, ranks }});
     }}
     return rounds;
 }}
 
-const roundData = decodeBinary(B64);
-const map = new maplibregl.Map({{
-    container: 'map',
-    style: style,
-    center: [0, 20],
-    zoom: 1.5,
-    attributionControl: false
-}});
-
-let canvas, ctx, imgData, sourceAdded = false, playInterval = null, curIdx = 0;
+const data = decode(B64);
+let canvas, ctx, sourceAdded = false;
 
 map.on('load', () => {{
     map.resize();
     canvas = document.createElement('canvas');
     canvas.width = META.n_lon; canvas.height = META.n_lat;
     ctx = canvas.getContext('2d');
-    imgData = ctx.createImageData(canvas.width, canvas.height);
     
-    document.getElementById('round-sl').max = roundData.length - 1;
-    update(0);
+    document.getElementById('slider').max = data.length - 1;
+    document.getElementById('info').textContent = "Ready";
+    render(0);
 }});
 
-function update(idx) {{
-    if (!roundData[idx]) return;
-    const {{ rnum, n_active, ranks }} = roundData[idx];
-    const d = imgData.data;
+function render(idx) {{
+    const round = data[idx];
+    if(!round) return;
     
-    // Fill background with subtle transparency
-    for (let i = 0; i < d.length; i += 4) d[i+3] = 0;
-
-    for (let i = 0; i < ranks.length; i++) {{
-        const r = ranks[i];
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const imgData = ctx.createImageData(canvas.width, canvas.height);
+    
+    for(let i=0; i<round.ranks.length; i++) {{
+        const r = round.ranks[i];
         const x = i % META.n_lon;
-        const y = META.n_lat - 1 - Math.floor(i / META.n_lon);
-        const cp = (y * META.n_lon + x) * 4;
-
-        if (r === 0) {{ // Winner (Green)
-            d[cp]=0; d[cp+1]=255; d[cp+2]=0; d[cp+3]=200;
-        }} else if (r <= 5) {{ // Top 5 (Yellow)
-            d[cp]=255; d[cp+1]=255; d[cp+2]=0; d[cp+3]=150;
-        }} else if (r >= n_active - 1) {{ // Last Place (Red)
-            d[cp]=255; d[cp+1]=0; d[cp+2]=0; d[cp+3]=180;
+        const y = META.n_lat - 1 - Math.floor(i / META.n_lon); // Flip Y
+        const pos = (y * META.n_lon + x) * 4;
+        
+        if (r === 0) {{ // Win (Green)
+            imgData.data[pos]=0; imgData.data[pos+1]=255; imgData.data[pos+2]=0; imgData.data[pos+3]=230;
+        }} else if (r < 5) {{ // Top 5 (Yellow)
+            imgData.data[pos]=255; imgData.data[pos+1]=255; imgData.data[pos+2]=0; imgData.data[pos+3]=180;
+        }} else if (r > round.nActive - 3) {{ // Loser (Red)
+            imgData.data[pos]=255; imgData.data[pos+1]=0; imgData.data[pos+2]=0; imgData.data[pos+3]=200;
         }}
     }}
     
@@ -177,50 +161,36 @@ function update(idx) {{
     const url = canvas.toDataURL();
     const coords = [[-180, 90], [180, 90], [180, -90], [-180, -90]];
 
-    if (!sourceAdded) {{
-        map.addSource('rk', {{ type: 'image', url: url, coordinates: coords }});
-        map.addLayer({{ id: 'rk-layer', type: 'raster', source: 'rk' }});
-        
-        // Add round target point
-        map.addSource('tgt', {{ type: 'geojson', data: {{ type: 'FeatureCollection', features: [] }} }});
-        map.addLayer({{ id: 'tgt-layer', type: 'circle', source: 'tgt', paint: {{ 'circle-radius': 8, 'circle-color': '#fff', 'circle-stroke-width': 2 }} }});
+    if(!sourceAdded) {{
+        map.addSource('overlay', {{ type: 'image', url: url, coordinates: coords }});
+        map.addLayer({{ id: 'overlay-layer', type: 'raster', source: 'overlay' }});
         sourceAdded = true;
     }} else {{
-        map.getSource('rk').updateImage({{ url, coordinates: coords }});
+        map.getSource('overlay').updateImage({{ url: url, coordinates: coords }});
     }}
-
-    // Update target point
-    const roundName = "Round " + rnum;
-    const tgt = META.round_targets[roundName];
-    if (tgt) {{
-        map.getSource('tgt').setData({{
-            type: 'Feature',
-            geometry: {{ type: 'Point', coordinates: tgt }}
-        }});
-    }}
-
-    document.getElementById('s-round').textContent = rnum;
-    document.getElementById('s-active').textContent = n_active;
-    curIdx = idx;
+    
+    document.getElementById('info').textContent = "Round " + (idx + 1) + " | Active: " + round.nActive;
 }}
 
-document.getElementById('round-sl').oninput = (e) => update(parseInt(e.target.value));
-document.getElementById('play-btn').onclick = function() {{
-    if (playInterval) {{
-        clearInterval(playInterval); playInterval = null;
-        this.textContent = "▶ Play";
-    }} else {{
-        this.textContent = "⏸ Pause";
-        playInterval = setInterval(() => {{
-            curIdx = (curIdx + 1) % roundData.length;
-            document.getElementById('round-sl').value = curIdx;
-            update(curIdx);
-        }}, 400);
-    }}
+document.getElementById('slider').oninput = (e) => render(parseInt(e.target.value));
+
+let playing = false;
+let intv;
+document.getElementById('play').onclick = () => {{
+    playing = !playing;
+    document.getElementById('play').textContent = playing ? "⏸ Pause" : "▶ Play";
+    if(playing) {{
+        intv = setInterval(() => {{
+            let s = document.getElementById('slider');
+            let v = (parseInt(s.value) + 1) % data.length;
+            s.value = v;
+            render(v);
+        }}, 300);
+    }} else clearInterval(intv);
 }};
 </script>
 </body>
 </html>
 """
 
-components.html(HTML, height=750, scrolling=False)
+components.html(HTML, height=750)
