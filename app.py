@@ -1,15 +1,7 @@
-"""
-app.py — Streamlit Cloud deployment for Gauntlet Timelapse.
-
-Run precompute.py locally first to generate static/ranks/*.bin and
-static/player_index.json, then commit the static/ folder to your repo.
-"""
-
 import streamlit as st
 import streamlit.components.v1 as components
 import json
 import os
-import struct
 import base64
 import pandas as pd
 import numpy as np
@@ -22,26 +14,17 @@ RANKS_DIR   = "static/ranks"
 GRID_STEP   = 1.0
 
 # ─────────────────────────────────────────────
-# Sanity checks
-# ─────────────────────────────────────────────
-if not os.path.exists(CSV_PATH):
-    st.error(f"`{CSV_PATH}` not found. Please ensure it is in the root directory.")
-    st.stop()
-
-if not os.path.exists(INDEX_PATH):
-    st.error(f"`{INDEX_PATH}` not found. Run `python precompute.py` locally and commit the `static/` folder.")
-    st.stop()
-
-# ─────────────────────────────────────────────
-# Load metadata (cached)
+# Loading Logic
 # ─────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def load_meta():
+    if not os.path.exists(CSV_PATH) or not os.path.exists(INDEX_PATH):
+        return None
+    
     df = pd.read_csv(CSV_PATH)
     df.columns = [c.strip() for c in df.columns]
     round_cols  = [c for c in df.columns if c.startswith("Round")]
     
-    # Get location row
     loc_row     = df[df["Name"] == "Location"].iloc[0]
     player_rows = df[df["Name"] != "Location"].copy()
     all_players = player_rows["Name"].str.strip().tolist()
@@ -56,8 +39,7 @@ def load_meta():
             try:
                 parts = str(val).split(",")
                 round_targets[col] = [float(parts[0].strip()), float(parts[1].strip())]
-            except Exception:
-                pass
+            except: pass
 
     round_active = {}
     for col in round_cols:
@@ -69,223 +51,150 @@ def load_meta():
 
     return all_players, round_cols, round_targets, round_active, name_to_file
 
-all_players, round_cols, round_targets, round_active, name_to_file = load_meta()
+meta_data = load_meta()
+if not meta_data:
+    st.error("Missing files. Please ensure `roundlist.csv` and `static/player_index.json` exist.")
+    st.stop()
 
-# ─────────────────────────────────────────────
-# Load per-player rank binary (cached per player)
-# ─────────────────────────────────────────────
+all_players, round_cols, round_targets, round_active, name_to_file = meta_data
+
 @st.cache_data(show_spinner=False)
 def load_player_b64(player_name):
     safe = name_to_file.get(player_name)
-    if not safe:
-        return None
     fpath = os.path.join(RANKS_DIR, f"{safe}.bin")
-    if not os.path.exists(fpath):
-        return None
+    if not os.path.exists(fpath): return None
     with open(fpath, "rb") as f:
-        raw = f.read()
-    return base64.b64encode(raw).decode("ascii")
+        return base64.b64encode(f.read()).decode("ascii")
 
 # ─────────────────────────────────────────────
-# Player selector
+# UI
 # ─────────────────────────────────────────────
 st.title("Gauntlet Timelapse")
 
 players_with_data = [p for p in all_players if name_to_file.get(p) and
                      os.path.exists(os.path.join(RANKS_DIR, name_to_file[p] + ".bin"))]
 
-if not players_with_data:
-    st.warning("No processed player data found in `static/ranks/`. Check your precompute step.")
-    st.stop()
-
 selected_player = st.selectbox("Select Player", sorted(players_with_data))
-
 b64_data = load_player_b64(selected_player)
-if not b64_data:
-    st.error(f"No rank data found for {selected_player}.")
-    st.stop()
 
-# ─────────────────────────────────────────────
-# Build compact metadata
-# ─────────────────────────────────────────────
 lats = np.arange(-90, 91, GRID_STEP)
 lons = np.arange(-180, 181, GRID_STEP)
-N_GRID = len(lats) * len(lons)
-
 player_rounds = [col for col in round_cols if selected_player in round_active.get(col, [])]
 
 meta = {
-    "player":        selected_player,
-    "n_lat":         len(lats),
-    "n_lon":         len(lons),
-    "n_grid":        N_GRID,
-    "round_cols":    player_rounds,
+    "n_lat": len(lats), "n_lon": len(lons),
     "round_targets": {col: round_targets.get(col) for col in player_rounds},
-    "round_active_counts": {col: len(round_active.get(col, [])) for col in player_rounds},
 }
-meta_js = json.dumps(meta, separators=(",", ":"))
-
-fsize = len(base64.b64decode(b64_data))
-st.caption(f"{selected_player} · {len(player_rounds)} rounds · {fsize/1e3:.0f} KB rank data")
+meta_js = json.dumps(meta)
 
 # ─────────────────────────────────────────────
-# HTML component
+# JS/HTML
 # ─────────────────────────────────────────────
-HTML = f"""<!DOCTYPE html>
-<html lang="en">
+HTML = f"""
+<!DOCTYPE html>
+<html>
 <head>
-<meta charset="UTF-8">
-<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
-<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
-<style>
-  * {{ box-sizing:border-box; margin:0; padding:0; }}
-  body {{ font-family:system-ui,sans-serif; background:#1a1a2e; color:#e0e0e0;
-          display:flex; flex-direction:column; height:100vh; overflow:hidden; }}
-
-  #toolbar {{ background:#16213e; border-bottom:1px solid #0f3460;
-    padding:10px 16px; display:flex; align-items:center; gap:18px; flex-shrink:0; flex-wrap:wrap; }}
-  #toolbar h1 {{ font-size:1rem; font-weight:700; color:#e94560; white-space:nowrap; }}
-
-  .ctrl {{ display:flex; align-items:center; gap:8px; }}
-  label {{ font-size:0.75rem; color:#8892b0; white-space:nowrap; }}
-  input[type=range] {{ accent-color:#e94560; cursor:pointer; width:200px; }}
-
-  .stat {{ background:#0f3460; border-radius:6px; padding:6px 12px; text-align:center; }}
-  .stat .val {{ font-size:1.1rem; font-weight:700; color:#e94560; }}
-  .stat .key {{ font-size:0.65rem; color:#8892b0; }}
-
-  .play-btn {{ background:#e94560; color:white; border:none; border-radius:6px;
-    padding:7px 16px; font-size:0.85rem; font-weight:600; cursor:pointer; }}
-  .play-btn.playing {{ background:#0f3460; border:1px solid #e94560; color:#e94560; }}
-
-  #map-wrap {{ flex:1; position:relative; }}
-  #map {{ width:100%; height:100%; }}
-
-  #overlay {{ position:absolute; inset:0; background:rgba(26,26,46,0.9);
-    display:flex; flex-direction:column; align-items:center; justify-content:center;
-    z-index:10; gap:12px; transition: opacity 0.3s; }}
-  #overlay.hidden {{ opacity: 0; pointer-events: none; }}
-  .spinner {{ width:40px; height:40px; border:3px solid #0f3460;
-    border-top-color:#e94560; border-radius:50%; animation:spin 0.8s linear infinite; }}
-  @keyframes spin {{ to{{ transform:rotate(360deg); }} }}
-</style>
+    <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+    <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+    <style>
+        body {{ margin:0; padding:0; background:#1a1a2e; color:white; font-family:sans-serif; }}
+        #map {{ position:absolute; top:50px; bottom:0; width:100%; background:#000; }}
+        #controls {{ height:50px; display:flex; align-items:center; padding:0 15px; gap:15px; background:#16213e; }}
+        #overlay {{ position:absolute; inset:0; background:rgba(0,0,0,0.8); z-index:10; 
+                    display:flex; justify-content:center; align-items:center; }}
+        .hidden {{ display:none !important; }}
+    </style>
 </head>
 <body>
-<div id="toolbar">
-  <h1>Gauntlet Timelapse</h1>
-  <div class="ctrl"><label>Round</label><input type="range" id="round-sl" min="0" max="0" value="0"></div>
-  <div class="stat"><div class="val" id="s-round">—</div><div class="key">Round</div></div>
-  <div class="stat"><div class="val" id="s-active">—</div><div class="key">Active</div></div>
-  <div class="stat" id="tgt-wrap" style="display:none">
-    <div class="val" style="font-size:0.75rem" id="s-target">—</div><div class="key">Target</div>
-  </div>
-  <button class="play-btn" id="play-btn">▶ Play</button>
-</div>
-
-<div id="map-wrap">
-  <div id="overlay"><div class="spinner"></div><div id="load-msg">Initializing Map...</div></div>
-  <div id="map"></div>
-</div>
+    <div id="controls">
+        <label>Round</label>
+        <input type="range" id="round-sl" min="0" value="0" style="width:300px">
+        <span id="round-val">0</span>
+    </div>
+    <div id="map-wrap">
+        <div id="overlay">Loading Map Data...</div>
+        <div id="map"></div>
+    </div>
 
 <script>
 const META = {meta_js};
-const B64  = "{b64_data}";
-
-const {{ n_lat, n_lon, round_targets }} = META;
+const B64 = "{b64_data}";
 
 function decodeBinary(b64) {{
-  const bin = atob(b64);
-  const buf = new ArrayBuffer(bin.length);
-  const u8  = new Uint8Array(buf);
-  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-  const view     = new DataView(buf);
-  const n_rounds = view.getUint16(0, true);
-  const ng       = view.getUint32(2, true);
-  const rounds   = [];
-  let offset     = 6;
-  for (let i = 0; i < n_rounds; i++) {{
-    const rnum     = view.getUint16(offset,     true); offset += 2;
-    const n_active = view.getUint16(offset,     true); offset += 2;
-    const ranks    = new Uint8Array(buf, offset, ng);  offset += ng;
-    rounds.push({{ rnum, n_active, ranks }});
-  }}
-  return rounds;
+    try {{
+        const bin = atob(b64);
+        const buf = new ArrayBuffer(bin.length);
+        const u8 = new Uint8Array(buf);
+        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        const view = new DataView(buf);
+        const n_rounds = view.getUint16(0, true);
+        const ng = view.getUint32(2, true);
+        const rounds = [];
+        let offset = 6;
+        for (let i = 0; i < n_rounds; i++) {{
+            offset += 4; // skip rnum and n_active
+            rounds.push(new Uint8Array(buf, offset, ng));
+            offset += ng;
+        }}
+        return rounds;
+    }} catch(e) {{ console.error("Decode Error:", e); return []; }}
 }}
 
 const roundData = decodeBinary(B64);
-const n_rounds  = roundData.length;
-
 const map = new maplibregl.Map({{
-  container: "map",
-  style: "https://demotiles.maplibre.org/style.json",
-  center: [0, 20], zoom: 1.2,
+    container: 'map',
+    style: 'https://demotiles.maplibre.org/style.json', // Basic style
+    center: [0, 20], zoom: 1.5
 }});
 
-let canvas, ctx, imgData, mapReady = false, sourceAdded = false, curIdx = 0;
+let canvas, ctx, imgData, sourceAdded = false;
 
-const C = {{
-  dg:[0,102,0,230], lg:[0,204,0,153],
-  lr:[255,102,102,153], dr:[139,0,0,230], none:[0,0,0,0],
-}};
+map.on('load', () => {{
+    console.log("Map Loaded");
+    document.getElementById('overlay').classList.add('hidden');
+    
+    canvas = document.createElement('canvas');
+    canvas.width = META.n_lon; 
+    canvas.height = META.n_lat;
+    ctx = canvas.getContext('2d');
+    imgData = ctx.createImageData(canvas.width, canvas.height);
+    
+    document.getElementById('round-sl').max = roundData.length - 1;
+    update(0);
+}});
 
-function paint(ranks, nActive) {{
-  const d = imgData.data;
-  for (let li = 0; li < n_lat; li++) {{
-    for (let oj = 0; oj < n_lon; oj++) {{
-      const gi = li * n_lon + oj;
-      const ci = (n_lat - 1 - li) * n_lon + oj;
-      const r  = ranks[gi];
-      const c  = r === 0 ? C.dg : r <= 2 ? C.lg : r >= nActive - 1 ? C.dr : (r >= nActive-3 && nActive > 4) ? C.lr : C.none;
-      const p = ci * 4;
-      d[p]=c[0]; d[p+1]=c[1]; d[p+2]=c[2]; d[p+3]=c[3];
+function update(idx) {{
+    if (!roundData[idx]) return;
+    const ranks = roundData[idx];
+    const d = imgData.data;
+    
+    // Simple heatmap paint
+    for (let i = 0; i < ranks.length; i++) {{
+        const p = i * 4;
+        const r = ranks[i];
+        d[p] = r === 0 ? 0 : 255;   // Red channel
+        d[p+1] = r === 0 ? 255 : 0; // Green channel
+        d[p+3] = r < 10 ? 200 : 0;  // Alpha
     }}
-  }}
-  ctx.putImageData(imgData, 0, 0);
+    
+    ctx.putImageData(imgData, 0, 0);
+    const url = canvas.toDataURL();
+    const coords = [[-180, 90], [180, 90], [180, -90], [-180, -90]];
+
+    if (!sourceAdded) {{
+        map.addSource('rk', {{ type: 'image', url: url, coordinates: coords }});
+        map.addLayer({{ id: 'rk-layer', type: 'raster', source: 'rk' }});
+        sourceAdded = true;
+    }} else {{
+        map.getSource('rk').updateImage({{ url: url, coordinates: coords }});
+    }}
+    document.getElementById('round-val').textContent = idx;
 }}
 
-const COORDS = [[-180,90],[180,90],[180,-90],[-180,-90]];
-function update() {{
-  if (!mapReady || !roundData.length) return;
-  const {{ rnum, n_active, ranks }} = roundData[curIdx];
-  document.getElementById("s-round").textContent  = rnum;
-  document.getElementById("s-active").textContent = n_active;
-  
-  paint(ranks, n_active);
-  const url = canvas.toDataURL("image/png");
-  if (!sourceAdded) {{
-    map.addSource("rk", {{ type:"image", url, coordinates:COORDS }});
-    map.addLayer({{ id:"rk-layer", type:"raster", source:"rk", paint:{{"raster-opacity":0.75}} }});
-    sourceAdded = true;
-  }} else {{
-    map.getSource("rk").updateImage({{ url, coordinates:COORDS }});
-  }}
-}}
-
-// ── Boot sequence with safety timeout ──
-async function init() {{
-  canvas = document.createElement("canvas");
-  canvas.width = n_lon; canvas.height = n_lat;
-  ctx = canvas.getContext("2d");
-  imgData = ctx.createImageData(n_lon, n_lat);
-
-  const mapLoad = new Promise(r => map.on("load", r));
-  const timeout = new Promise(r => setTimeout(r, 2500)); // 2.5s safety
-
-  await Promise.any([mapLoad, timeout]);
-  
-  mapReady = true;
-  document.getElementById("overlay").classList.add("hidden");
-  document.getElementById("round-sl").max = n_rounds - 1;
-  update();
-}}
-
-init();
-
-document.getElementById("round-sl").addEventListener("input", e => {{
-  curIdx = +e.target.value; update();
-}});
+document.getElementById('round-sl').oninput = (e) => update(e.target.value);
 </script>
 </body>
-</html>"""
+</html>
+"""
 
-components.html(HTML, height=700, scrolling=False)
+components.html(HTML, height=600)
