@@ -177,12 +177,18 @@ def load_data():
         active = player_rows.loc[player_rows[col].apply(is_active), "Name"].str.strip().tolist()
         round_active[col] = active
 
-    # Determine player count from binary size (no base64 needed)
+    # Determine player count from binary size
     lats = np.arange(-90,  91,  GRID_STEP)
     lons = np.arange(-180, 181, GRID_STEP)
     N_GRID = len(lats) * len(lons)
     bin_size = os.path.getsize(BIN_PATH)
     n_players_in_bin = bin_size // (N_GRID * 4)
+
+    # Base64-encode the binary — embedded directly in HTML, no fetch needed
+    import base64
+    with open(BIN_PATH, "rb") as f:
+        raw = f.read()
+    b64 = base64.b64encode(raw).decode("ascii")
 
     meta = {
         "players":          all_players,
@@ -193,9 +199,9 @@ def load_data():
         "round_targets":    round_targets,
         "round_active":     {col: active for col, active in round_active.items()},
     }
-    return meta
+    return meta, b64
 
-meta = load_data()
+meta, b64_data = load_data()
 
 meta_js = json.dumps(meta, separators=(",", ":"))
 
@@ -298,9 +304,10 @@ HTML = f"""<!DOCTYPE html>
 
 <script>
 const META   = {meta_js};
+const B64    = "{b64_data}";
 
 const {{ players, n_lat, n_lon, round_cols, round_targets, round_active }} = META;
-const N_GRID   = n_lat * n_lon;
+const N_GRID = n_lat * n_lon;
 
 const map = new maplibregl.Map({{
   container: "map",
@@ -314,15 +321,36 @@ let curPlayerIdx = 0, curRoundIdx = 0;
 let activeRoundCols = [];
 let playInterval = null, mapReady = false, sourceAdded = false;
 
-// ── Fetch binary with progress bar ────────
-async function loadBinary() {{
-  setLoading("Fetching grid data…", 0);
-  const resp = await fetch("/app/static/gauntlet_data.bin");
-  if (!resp.ok) throw new Error("Failed to fetch gauntlet_data.bin: " + resp.status);
-  setLoading("Fetching grid data…", 50);
-  const buffer = await resp.arrayBuffer();
-  setLoading("Fetching grid data…", 100);
-  return new Float32Array(buffer);
+// ── Decode base64 in a Web Worker ─────────
+// Runs off the main thread so the spinner stays animated and
+// the browser doesn't appear frozen.
+function decodeInWorker(b64) {{
+  return new Promise((resolve, reject) => {{
+    const workerSrc = `
+      self.onmessage = function(e) {{
+        const b64 = e.data;
+        const bin = atob(b64);
+        const buf = new ArrayBuffer(bin.length);
+        const u8  = new Uint8Array(buf);
+        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        self.postMessage(buf, [buf]);
+      }};
+    `;
+    const blob   = new Blob([workerSrc], {{ type: "application/javascript" }});
+    const url    = URL.createObjectURL(blob);
+    const worker = new Worker(url);
+    worker.onmessage = (e) => {{
+      URL.revokeObjectURL(url);
+      worker.terminate();
+      resolve(new Float32Array(e.data));
+    }};
+    worker.onerror = (e) => {{
+      URL.revokeObjectURL(url);
+      worker.terminate();
+      reject(e);
+    }};
+    worker.postMessage(b64);
+  }});
 }}
 
 // ── Rank grid ─────────────────────────────
@@ -446,9 +474,10 @@ document.getElementById("speed-sl").addEventListener("input", e => {{
 map.on("load", () => {{ mapReady = true; }});
 
 (async () => {{
-  document.getElementById("load-msg").textContent = "Fetching grid data…";
-  grids = await loadBinary();
-  document.getElementById("load-bar").style.width = "100%";
+  document.getElementById("load-msg").textContent = "Decoding grid data…";
+  setLoading("Decoding grid data…", 10);
+  grids = await decodeInWorker(B64);
+  setLoading("Decoding grid data…", 100);
 
   canvas       = document.createElement("canvas");
   canvas.width  = n_lon; canvas.height = n_lat;
