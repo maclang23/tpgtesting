@@ -79,8 +79,7 @@ const map = new maplibregl.Map({{
         "layers": [{{ "id": "osm", "type": "raster", "source": "osm" }}]
     }},
     center: [0, 20], zoom: 1.5,
-    renderWorldCopies: false,
-    maxBounds: [[-180, -90], [180, 90]]
+    renderWorldCopies: false
 }});
 
 function decode(b64) {{
@@ -129,19 +128,21 @@ function render(idx) {{
     const ranks = data.ranks;
     const nActive = data.nActive;
 
-    for(let li=0; li < META.n_lat; li++) {{
-        for(let lj=0; lj < META.n_lon; lj++) {{
-            const gi  = li * META.n_lon + lj;
-            const ci  = (META.n_lat - 1 - li) * META.n_lon + lj;
-            const pos = ci * 4;
-            const r   = data.ranks[gi];
-            if (r === 0) {{
-                imgData.data[pos]=0;   imgData.data[pos+1]=255; imgData.data[pos+2]=0;   imgData.data[pos+3]=220;
-            }} else if (r < 5) {{
-                imgData.data[pos]=255; imgData.data[pos+1]=255; imgData.data[pos+2]=0;   imgData.data[pos+3]=160;
-            }} else if (r >= data.nActive - 1) {{
-                imgData.data[pos]=255; imgData.data[pos+1]=0;   imgData.data[pos+2]=0;   imgData.data[pos+3]=180;
-            }}
+    for(let i=0; i < ranks.length; i++) {{
+        const r = ranks[i];
+        if (r === 255) continue; // Out of bounds/NaN
+
+        const x = i % META.n_lon;
+        const y = META.n_lat - 1 - Math.floor(i / META.n_lon); // Flip Y to match map
+        const pos = (y * META.n_lon + x) * 4;
+        
+        // Heatmap Logic
+        if (r === 0) {{ // 1st Place (Bright Green)
+            imgData.data[pos]=0; imgData.data[pos+1]=255; imgData.data[pos+2]=0; imgData.data[pos+3]=220;
+        }} else if (r < 5) {{ // Top 5 (Yellow)
+            imgData.data[pos]=255; imgData.data[pos+1]=255; imgData.data[pos+2]=0; imgData.data[pos+3]=160;
+        }} else if (r >= nActive - 1) {{ // Last Place (Red)
+            imgData.data[pos]=255; imgData.data[pos+1]=0; imgData.data[pos+2]=0; imgData.data[pos+3]=180;
         }}
     }}
     
