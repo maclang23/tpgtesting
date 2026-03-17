@@ -78,7 +78,9 @@ const map = new maplibregl.Map({{
         "sources": {{ "osm": {{ "type": "raster", "tiles": ["https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png"], "tileSize": 256 }} }},
         "layers": [{{ "id": "osm", "type": "raster", "source": "osm" }}]
     }},
-    center: [0, 20], zoom: 1.5
+    center: [0, 20], zoom: 1.5,
+    renderWorldCopies: false,
+    maxBounds: [[-180, -90], [180, 90]]
 }});
 
 function decode(b64) {{
@@ -124,24 +126,22 @@ function render(idx) {{
     if(!data) return;
     
     const imgData = ctx.createImageData(canvas.width, canvas.height);
-    const ranks   = data.ranks;
+    const ranks = data.ranks;
     const nActive = data.nActive;
 
-    for(let li = 0; li < META.n_lat; li++) {{
-        for(let lj = 0; lj < META.n_lon; lj++) {{
-            const gi  = li * META.n_lon + lj;                          // rank array: row 0 = south (-90)
-            const ci  = (META.n_lat - 1 - li) * META.n_lon + lj;      // canvas: row 0 = north (+90)
+    for(let li=0; li < META.n_lat; li++) {{
+        for(let lj=0; lj < META.n_lon; lj++) {{
+            const gi  = li * META.n_lon + lj;
+            const ci  = (META.n_lat - 1 - li) * META.n_lon + lj;
             const pos = ci * 4;
-            const r   = ranks[gi];
-
+            const r   = data.ranks[gi];
             if (r === 0) {{
                 imgData.data[pos]=0;   imgData.data[pos+1]=255; imgData.data[pos+2]=0;   imgData.data[pos+3]=220;
             }} else if (r < 5) {{
                 imgData.data[pos]=255; imgData.data[pos+1]=255; imgData.data[pos+2]=0;   imgData.data[pos+3]=160;
-            }} else if (r >= nActive - 1) {{
+            }} else if (r >= data.nActive - 1) {{
                 imgData.data[pos]=255; imgData.data[pos+1]=0;   imgData.data[pos+2]=0;   imgData.data[pos+3]=180;
             }}
-            // else: stays transparent (0,0,0,0) from createImageData
         }}
     }}
     
