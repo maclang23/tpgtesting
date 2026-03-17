@@ -317,21 +317,11 @@ let playInterval = null, mapReady = false, sourceAdded = false;
 // ── Fetch binary with progress bar ────────
 async function loadBinary() {{
   setLoading("Fetching grid data…", 0);
-  const resp  = await fetch("/app/static/gauntlet_data.bin");
+  const resp = await fetch("/app/static/gauntlet_data.bin");
   if (!resp.ok) throw new Error("Failed to fetch gauntlet_data.bin: " + resp.status);
-  const total = parseInt(resp.headers.get("Content-Length") || "0");
-  const reader = resp.body.getReader();
-  const chunks = [];
-  let received = 0;
-  while (true) {{
-    const {{ done, value }} = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    received += value.byteLength;
-    if (total > 0) setLoading("Fetching grid data…", received / total * 100);
-  }}
-  const blob   = new Blob(chunks);
-  const buffer = await blob.arrayBuffer();
+  setLoading("Fetching grid data…", 50);
+  const buffer = await resp.arrayBuffer();
+  setLoading("Fetching grid data…", 100);
   return new Float32Array(buffer);
 }}
 
