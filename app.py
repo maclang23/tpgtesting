@@ -334,12 +334,12 @@ let activeRoundCols = [];
 let playInterval = null, mapReady = false, sourceAdded = false;
 
 // ── Base64 → Float32Array ──────────────────
-function b64ToFloat32(b64) {{
-  const bin = atob(b64);
-  const buf = new ArrayBuffer(bin.length);
-  const u8  = new Uint8Array(buf);
-  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-  return new Float32Array(buf);
+async function b64ToFloat32(b64) {{
+  // fetch() on a data URL uses the browser's native C++ base64 decoder —
+  // orders of magnitude faster than the JS atob() + charCodeAt loop.
+  const resp   = await fetch("data:application/octet-stream;base64," + b64);
+  const buffer = await resp.arrayBuffer();
+  return new Float32Array(buffer);
 }}
 
 // ── Rank grid ─────────────────────────────
@@ -464,9 +464,7 @@ map.on("load", () => {{ mapReady = true; }});
 
 (async () => {{
   document.getElementById("load-msg").textContent = "Decoding grid data…";
-  // Decode in a setTimeout so the UI can update first
-  await new Promise(r => setTimeout(r, 50));
-  grids = b64ToFloat32(B64);
+  grids = await b64ToFloat32(B64);
   document.getElementById("load-bar").style.width = "100%";
 
   canvas       = document.createElement("canvas");
